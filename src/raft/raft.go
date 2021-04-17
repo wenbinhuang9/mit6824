@@ -276,14 +276,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//. If leaderCommit > commitIndex, set commitIndex =
     //min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
+		oriCommitIdx := rf.commitIndex
+
 		rf.commitIndex = MinOf(len(rf.log) - 1, args.LeaderCommit)
 		PrefixDPrintf(rf, "update commitIndex to %d\n", rf.commitIndex)
-		command := ApplyMsg{}
-		command.CommandValid = true 
-		command.CommandIndex = rf.commitIndex
-		command.Command = rf.log[rf.commitIndex].Command
-		
-		rf.applyCh <- command
+		for N := oriCommitIdx + 1; N <= rf.commitIndex; N += 1 {
+			command := ApplyMsg{}
+			command.CommandValid = true 
+			command.CommandIndex = N
+			command.Command = rf.log[N].Command
+			rf.applyCh <- command
+		} 
 	}
 
 	reply.Term = rf.currentTerm
@@ -358,7 +361,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		//If votedFor is null or candidateId,
 		//and candidate’s log is at least as up-to-date as receiver’s log,
 		//&& rf.atLeastUptodate(args.LastLogIndex, args.LastLogTerm)
-		if (rf.votedFor == NILVOTE || rf.votedFor == args.CandidateId)  {
+		if (rf.votedFor == NILVOTE || rf.votedFor == args.CandidateId) &&  rf.atLeastUptodate(args.LastLogIndex, args.LastLogTerm) {
 			rf.votedFor = args.CandidateId	
 			reply.VoteGranted = true
 			reply.Term = rf.currentTerm
@@ -382,10 +385,11 @@ func (rf *Raft) atLeastUptodate(candidateLastLogIdx int , candidateLastLogTerm i
 	if candidateLastLogTerm > revLastLogTerm {
 		return true
 	}else if candidateLastLogTerm < revLastLogTerm {
+
 		return false
 	}else{
 		//candidateLastLogTerm == revLastLogTerm
-		return candidateLastLogIdx > revLastLogIdx
+		return candidateLastLogIdx >= revLastLogIdx
 	}
 }
 //
@@ -475,7 +479,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}	
 		}
 	}
-	PrefixDPrintf(rf, "Start reply %d, %d, %t\n", index, term, isLeader)
+	PrefixDPrintf(rf, "Start reply %d, %d, %t | %v\n", index, term, isLeader, rf.log)
 	return index, term, isLeader
 }
 
@@ -494,6 +498,9 @@ func (rf *Raft) makeAppendEntriesArgs(peer int) AppendEntriesArgs {
 
 		args.LeaderId = rf.me 
 		args.PrevLogIndex = peerNextIdx - 1
+		if args.PrevLogIndex >= len(rf.log) {
+			PrefixDPrintf(rf, "current peer %d, and raft %v\n", peer, rf)
+		}
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term 
 		args.Term = rf.currentTerm
 		args.LeaderCommit = rf.commitIndex
@@ -512,6 +519,13 @@ func (rf *Raft) sendAppendEntriesAsync(peer int) {
 	}() 
 }
 
+func (rf *Raft) retryAppendEntriesASync(peer int) {
+
+	time.Sleep(10 * time.Millisecond)
+
+	rf.sendAppendEntriesAsync(peer)
+
+}
 func (rf *Raft) sendAppendEntriesCallback(ok bool, peer int, args AppendEntriesArgs, reply AppendEntriesReply) {
 
 	rf.mu.Lock()
@@ -522,7 +536,7 @@ func (rf *Raft) sendAppendEntriesCallback(ok bool, peer int, args AppendEntriesA
 	}
 	if ok == false {
 		//retry 
-		rf.sendAppendEntriesAsync(peer)
+		rf.retryAppendEntriesASync(peer)
 		return 
 	}
 	//If RPC request or response contains term T > currentTerm:
@@ -538,6 +552,11 @@ func (rf *Raft) sendAppendEntriesCallback(ok bool, peer int, args AppendEntriesA
 		//If successful: update nextIndex and matchIndex for follower (5.3)
 		newNextIdx := rf.nextIndex[peer] + len(args.Entries)
 
+		if ( newNextIdx >= len(rf.log)) {
+			//todo the same request may return multiple success 
+			newNextIdx = len(rf.log)
+			PrefixDPrintf(rf, "next index %d bigger than log length %d, %v", newNextIdx, len(rf.log), args.Entries)
+		}
 		rf.nextIndex[peer] = newNextIdx
 
 		newMatchedIdx := newNextIdx - 1
@@ -546,7 +565,7 @@ func (rf *Raft) sendAppendEntriesCallback(ok bool, peer int, args AppendEntriesA
 		//If AppendEntries fails because of log inconsistency 
 		// decrement nextIndex and retry
 		rf.nextIndex[peer] = rf.nextIndex[peer] - 1
-		rf.sendAppendEntriesAsync(peer) 
+		rf.retryAppendEntriesASync(peer) 
 	}
 
 	go rf.updateCommitIndex()
@@ -691,14 +710,17 @@ func (rf *Raft) updateCommitIndex() {
 		}
 		// a majority of matchIndex[i] ≥ N,
 		if cnt > len(rf.peers) / 2 {
+			oriCommitIdx := rf.commitIndex
 			rf.commitIndex = N 
 			PrefixDPrintf(rf, "commitIndex updates to %d\n", N)
-			command := ApplyMsg{}
-			command.CommandValid = true 
-			command.CommandIndex = rf.commitIndex
-			command.Command = rf.log[N].Command
-			
-			rf.applyCh <- command
+
+			for cidx := oriCommitIdx + 1; cidx <= rf.commitIndex; cidx+=1 {
+				command := ApplyMsg{}
+				command.CommandValid = true 
+				command.CommandIndex = cidx
+				command.Command = rf.log[cidx].Command
+				rf.applyCh <- command
+			}
 			return
 		}
 	}
