@@ -195,6 +195,7 @@ type RequestVoteArgs struct {
 type Entry struct {
 	Term int 
 	Command interface{}
+	Index int 
 }
 type RequestVoteReply struct {
 	// Your data here (2A).
@@ -246,7 +247,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if (args.Term > currentTerm) {
 		rf.currentTerm = reply.Term
 		rf.votedFor = NILVOTE
-		rf.role = FOLLOWER 
+		if rf.role == LEADER  {
+			DPrintf("LeaderCondition sorry server %d  term %d not a leader, logs %v, commitIndex %d\n",rf.me, rf.currentTerm, rf.log, rf.commitIndex) 
+		}
+		rf.role = FOLLOWER
+
 	}
 
 	//discover leader, convert to follower
@@ -278,7 +283,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		oriCommitIdx := rf.commitIndex
 
-		rf.commitIndex = MinOf(len(rf.log) - 1, args.LeaderCommit)
+		rf.commitIndex = MinOf(rf.log[len(rf.log) - 1].Index, args.LeaderCommit)
 		PrefixDPrintf(rf, "update commitIndex to %d\n", rf.commitIndex)
 		for N := oriCommitIdx + 1; N <= rf.commitIndex; N += 1 {
 			command := ApplyMsg{}
@@ -326,6 +331,13 @@ func (rf *Raft) sendHeartbeats() {
 }
 
 func (rf *Raft) sendOneHeartbeat(server int) bool{
+	rf.mu.Lock()
+	if rf.role != LEADER {
+		rf.mu.Unlock()
+		return false
+	}
+	rf.mu.Unlock()
+
 	args := rf.makeAppendEntriesArgs(server)
 	reply := AppendEntriesReply{}
 	return rf.sendAppendEntries(server, &args, &reply)
@@ -350,7 +362,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (args.Term > currentTerm) {
 		rf.currentTerm = args.Term
 		rf.votedFor = NILVOTE
-		rf.role = FOLLOWER 
+
+		if rf.role == LEADER  {
+			DPrintf("LeaderCondition sorry server %d  term %d not a leader, logs %v, commitIndex %d\n",rf.me, rf.currentTerm, rf.log, rf.commitIndex) 
+		} 
+		rf.role = FOLLOWER
 	}
 
 	if args.Term < currentTerm {
@@ -441,8 +457,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func makeEntry(command interface{}, term int ) Entry{
-	return Entry{term, command}
+func makeEntry(command interface{}, term int , index int ) Entry{
+	return Entry{term, command, index}
 }
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
@@ -464,7 +480,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// The leader appends the command to its log as a new entry 
 	index = len(rf.log)
 	term = rf.currentTerm
-	entry := makeEntry(command, rf.currentTerm)
+	entry := makeEntry(command, rf.currentTerm, index)
 	rf.log = append(rf.log, entry)
 	rf.nextIndex[rf.me] = len(rf.log)
 	rf.matchIndex[rf.me] = len(rf.log) - 1
@@ -508,8 +524,18 @@ func (rf *Raft) makeAppendEntriesArgs(peer int) AppendEntriesArgs {
 		return args 
 }
 
-func (rf *Raft) sendAppendEntriesAsync(peer int) {
+func (rf *Raft) sendAppendEntriesAsync(peer int) {	
+
 	go func() {
+		rf.mu.Lock()
+
+		if rf.role != LEADER {
+			PrefixDPrintf(rf, "not a leader, stop to send AppendEntries")
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+
 		args := rf.makeAppendEntriesArgs(peer)
 		var reply AppendEntriesReply
 
@@ -544,23 +570,29 @@ func (rf *Raft) sendAppendEntriesCallback(ok bool, peer int, args AppendEntriesA
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term 
 		rf.votedFor = NILVOTE
+		if rf.role == LEADER  {
+			DPrintf("LeaderCondition sorry server %d  term %d not a leader, logs %v, commitIndex %d\n",rf.me, rf.currentTerm, rf.log, rf.commitIndex) 
+		}	
 		rf.role = FOLLOWER
 		return 
 	}
 
 	if reply.Success == true {
 		//If successful: update nextIndex and matchIndex for follower (5.3)
-		newNextIdx := rf.nextIndex[peer] + len(args.Entries)
-
-		if ( newNextIdx >= len(rf.log)) {
-			//todo the same request may return multiple success 
-			newNextIdx = len(rf.log)
-			PrefixDPrintf(rf, "next index %d bigger than log length %d, %v", newNextIdx, len(rf.log), args.Entries)
+		if (len(args.Entries) > 0) {
+			argsLastEntry := args.Entries[len(args.Entries) - 1]
+			newNextIdx := argsLastEntry.Index + 1
+	
+			// if ( newNextIdx >= len(rf.log)) {
+			// 	//todo the same request may return multiple success 
+			// 	newNextIdx = len(rf.log)
+			// 	PrefixDPrintf(rf, "next index %d bigger than log length %d, %v", newNextIdx, len(rf.log), args.Entries)
+			// }
+			rf.nextIndex[peer] = newNextIdx
+	
+			newMatchedIdx := newNextIdx - 1
+			rf.matchIndex[peer] = newMatchedIdx
 		}
-		rf.nextIndex[peer] = newNextIdx
-
-		newMatchedIdx := newNextIdx - 1
-		rf.matchIndex[peer] = newMatchedIdx
 	}else {
 		//If AppendEntries fails because of log inconsistency 
 		// decrement nextIndex and retry
@@ -650,8 +682,8 @@ func (rf *Raft) sendRequestVoteCallBack(ok bool, server int, args RequestVoteArg
 	
 	//If RPC request or response contains term T > currentTerm:
 	//set currentTerm = T, convert to follower
+
 	if reply.Term > rf.currentTerm {
-		// stop election 
 		PrefixDPrintf(rf, "stops election because of smaller currenterm = %d, reply term =%d, reply server = %d\n", rf.currentTerm, reply.Term, server)
 		rf.role = FOLLOWER
 		rf.currentTerm = reply.Term
@@ -667,7 +699,8 @@ func (rf *Raft) sendRequestVoteCallBack(ok bool, server int, args RequestVoteArg
 
 	if (len(rf.voteCount) > len(rf.peers) / 2 && rf.role == CANDIDATE) {
 		rf.role = LEADER
-		DPrintf("congratulations server %d  term %d becomes leader, got votes %d\n", rf.me, rf.currentTerm, len(rf.voteCount))
+		DPrintf("LeaderCondition congratulations server %d  term %d becomes leader, got total votes %d, logs %v, commitIndex %d\n", 
+		rf.me, rf.currentTerm, len(rf.voteCount),rf.log, rf.commitIndex)
 
 		for i, _ := range rf.nextIndex {
 			rf.nextIndex[i] = len(rf.log)
@@ -747,7 +780,7 @@ func (rf *Raft) startElection() {
 		if server != rf.me {
 			// todo make it concurrent here
 			lastLogIdx, lastLogTerm := rf.lastLogIdxAndTerm() 
-	
+
 			args := RequestVoteArgs {rf.currentTerm, rf.candidateId, lastLogIdx, lastLogTerm}
 			var  reply  RequestVoteReply
 			rf.sendRequestVoteAsync(server, args, reply) // any return value here 
@@ -758,14 +791,11 @@ func (rf *Raft) startElection() {
 func (rf *Raft) lastLogIdxAndTerm() (int, int ) {
 	var revLastLogIdx int 
 	var revLastLogTerm int 
-	if len(rf.log) > 0 {
-		lastEntry := rf.log[len(rf.log) - 1]
-		revLastLogIdx = len(rf.log) - 1
-		revLastLogTerm = lastEntry.Term 
-	}else {
-		revLastLogIdx = 0
-		revLastLogTerm = 0 
-	}
+
+	lastEntry := rf.log[len(rf.log) - 1]
+	revLastLogIdx = lastEntry.Index 
+	revLastLogTerm = lastEntry.Term 
+
 
 	return revLastLogIdx, revLastLogTerm
 }
@@ -800,7 +830,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
-	entry := Entry {0, nil}
+	entry := Entry {0, nil, 0}
 	rf.log = append(rf.log, entry)
 
 	// initialize from state persisted before a crash
